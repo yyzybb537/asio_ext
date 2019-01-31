@@ -22,12 +22,11 @@ public:
     /// The type of the executor associated with the object.
     using executor_type = typename next_layer_type::executor_type;
 
+    typedef void (*cb_type)(boost::system::error_code, std::size_t);
+
     using send_handler = std::function<void(boost::system::error_code const& ec, size_t bytes_transferred)>;
 
     struct option {
-        // max packet size
-        size_t max_packet_size = 64 * 1024;
-
         // max size per next_layer send op
         size_t max_size_per_send = 64 * 1024;
     };
@@ -115,76 +114,43 @@ public:
 
     /// ------------------- send/write
     template <typename ConstBufferSequence>
-    std::size_t send(const ConstBufferSequence& buffers, boost::system::error_code & ec)
+    std::size_t write(const ConstBufferSequence& buffers, boost::system::error_code & ec)
     {
-        if (ec_) {
-            ec = ec_;
-            return ;
-        }
-
-        std::unique_ptr<packet> pack(new packet);
-        for (auto it = buffer_sequence_begin(buffers); it != buffer_sequence_end(buffers); ++it) {
-            const_buffer const& buf = *it;
-            mutable_buffers_1 mbuf = buffer_adapter<PacketBuffer>::prepare(pack->buf_, buf.size());
-            ::memcpy(mbuf.data(), buf.data(), buf.size());
-            buffer_adapter<PacketBuffer>::commit(pack->buf_, buf.size());
-        }
-        return send(pack.release());
+        return stream_.write(buffers, ec);
     }
 
     template <typename ConstBufferSequence>
-    std::size_t send(const ConstBufferSequence& buffers)
+    std::size_t write(const ConstBufferSequence& buffers)
     {
-        boost::system::error_code ec;
-        std::size_t bytes_transferred = send(buffers, ec);
-        if(ec)
-            BOOST_THROW_EXCEPTION(system_error{ec});
-        return bytes_transferred;
+        return stream_.write(buffers);
     }
 
-    std::size_t send(PacketBuffer && buffer, boost::system::error_code & ec)
-    {
-        if (ec_) {
-            ec = ec_;
-            return ;
-        }
-
-        std::unique_ptr<packet> pack(new packet);
-        buffer_adapter<PacketBuffer>::swap(pack->buf_, buffer);
-        return send(pack.release());
-    }
-
-    template<class ConstBufferSequence>
-    std::size_t write(ConstBufferSequence const& buffers) {
-        return send(buffers);
-    }
-
-    template<class ConstBufferSequence>
-    std::size_t write(ConstBufferSequence const& buffers, error_code& ec) {
-        return send(buffers, ec);
-    }
-
-    template<class ConstBufferSequence>
-    std::size_t write_some(ConstBufferSequence const& buffers) {
-        return send(buffers);
-    }
-
-    template<class ConstBufferSequence>
-    std::size_t write_some(ConstBufferSequence const& buffers, error_code& ec) {
-        return send(buffers, ec);
-    }
-
-    template <typename ConstBufferSequence, typename WriteHandler>
+    template <typename WriteHandler = cb_type>
         BOOST_ASIO_INITFN_RESULT_TYPE(WriteHandler,
             void (boost::system::error_code, std::size_t))
-    async_write_some(const ConstBufferSequence& buffers,
-            BOOST_ASIO_MOVE_ARG(WriteHandler) handler)
+    async_write(PacketBuffer && buffer,
+            BOOST_ASIO_MOVE_ARG(WriteHandler) handler = nullptr)
     {
-        if (ec_) {
-            post_handler(handler, ec_, 0);
+        std::unique_ptr<packet> pack(new packet);
+        buffer_adapter<PacketBuffer>::swap(pack->buf_, buffer);
+        pack->handler_ = handler;
+
+        boost::system::error_code ec = async_send_packet(pack);
+        if (ec) {
+            if (pack->handler_)
+                post_handler(pack->handler_, ec, 0);
             return ;
         }
 
+        pack.release();
+    }
+
+    template <typename ConstBufferSequence, typename WriteHandler = cb_type>
+        BOOST_ASIO_INITFN_RESULT_TYPE(WriteHandler,
+            void (boost::system::error_code, std::size_t))
+    async_write(const ConstBufferSequence& buffers,
+            BOOST_ASIO_MOVE_ARG(WriteHandler) handler = nullptr)
+    {
         std::unique_ptr<packet> pack(new packet);
         for (auto it = buffer_sequence_begin(buffers); it != buffer_sequence_end(buffers); ++it) {
             const_buffer const& buf = *it;
@@ -192,39 +158,49 @@ public:
             ::memcpy(mbuf.data(), buf.data(), buf.size());
             buffer_adapter<PacketBuffer>::commit(pack->buf_, buf.size());
         }
-        pack.handler_ = handler;
-        return send(pack.release());
-    }
+        pack->handler_ = handler;
 
-    template <typename ConstBufferSequence, typename WriteHandler>
-        BOOST_ASIO_INITFN_RESULT_TYPE(WriteHandler,
-            void (boost::system::error_code, std::size_t))
-    async_send(const ConstBufferSequence& buffers,
-        BOOST_ASIO_MOVE_ARG(WriteHandler) handler)
-    {
-        return async_write_some(buffers, std::forward<WriteHandler>(handler));
+        boost::system::error_code ec = async_send_packet(pack);
+        if (ec) {
+            if (pack->handler_)
+                post_handler(pack->handler_, ec, 0);
+            return ;
+        }
+
+        pack.release();
     }
 
     /// ------------------- receive/read
-    template <typename MutableBufferSequence>
-    std::size_t receive(const MutableBufferSequence& buffers) {
-        return stream_.receive(buffers);
-    }
-
     template <typename MutableBufferSequence>
     std::size_t read_some(const MutableBufferSequence& buffers) {
         return stream_.read_some(buffers);
     }
 
+    template <typename MutableBufferSequence>
+    std::size_t read_some(const MutableBufferSequence& buffers, boost::system::error_code & ec) {
+        return stream_.read_some(buffers, ec);
+    }
+
+    template <typename MutableBufferSequence, typename ReadHandler>
+        BOOST_ASIO_INITFN_RESULT_TYPE(ReadHandler,
+            void (boost::system::error_code, std::size_t))
+    async_read_some(const MutableBufferSequence& buffers,
+        BOOST_ASIO_MOVE_ARG(ReadHandler) handler)
+    {
+        stream_.async_read_some(buffers, std::forward<ReadHandler>(handler));
+    }
+
 private:
-    std::size_t send(packet * pack)
+    boost::system::error_code async_send_packet(std::unique_ptr<packet> & pack)
     {
         size_t bytes = buffer_adapter<PacketBuffer>::size(pack->buf_);
         std::unique_lock<std::mutex> lock(send_mutex_);
-        send_queue_.push(pack);
+        if (ec_) return ec_;
+
+        send_queue_.push(pack.get());
         buffered_bytes_ += bytes;
         flush();
-        return bytes;
+        return boost::system::error_code();
     }
 
     void flush()
@@ -277,6 +253,7 @@ private:
     void handle_write(boost::system::error_code const& ec, size_t bytes)
     {
         std::unique_lock<std::mutex> lock(send_mutex_);
+        this->sending_ = false;
 
         if (ec) {
             handle_error(ec);
@@ -301,7 +278,9 @@ private:
             }
         }
 
-        this->sending_ = false;
+        assert(buffered_bytes_ >= bytes);
+        buffered_bytes_ -= bytes;
+
         flush();
     }
 
