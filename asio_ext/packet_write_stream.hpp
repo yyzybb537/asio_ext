@@ -1,6 +1,7 @@
 #pragma once
 #include <boost/asio.hpp>
 #include <boost/asio/streambuf.hpp>
+#include <boost/system/error_code.hpp>
 #include "buffer_adapter.hpp"
 #include "async_guard.hpp"
 
@@ -24,7 +25,7 @@ public:
 
     typedef void (*cb_type)(boost::system::error_code, std::size_t);
 
-    using send_handler = std::function<void(boost::system::error_code const& ec, size_t bytes_transferred)>;
+    using write_handler = std::function<void(boost::system::error_code const& ec, size_t bytes_transferred)>;
 
     struct option {
         // max size per next_layer send op
@@ -38,7 +39,7 @@ public:
     struct packet {
         PacketBuffer buf_;
 
-        send_handler handler_;
+        write_handler handler_;
 
         bool sending_ = false;
 
@@ -53,9 +54,6 @@ public:
 private:
     // next layer stream
     next_layer_type stream_;
-
-    // receive buffer
-    streambuf recv_buffer_;
 
     // send packets list
     send_queue<packet> send_queue_;
@@ -112,23 +110,31 @@ public:
         return stream_.lowest_layer();
     }
 
-    /// ------------------- send/write
+    void close() {
+        stream_.close();
+    }
+
+    void close(boost::system::error_code & ec) {
+        stream_.close(ec);
+    }
+
+    /// ------------------- write_some
     template <typename ConstBufferSequence>
-    std::size_t write(const ConstBufferSequence& buffers, boost::system::error_code & ec)
+    std::size_t write_some(const ConstBufferSequence& buffers, boost::system::error_code & ec)
     {
-        return stream_.write(buffers, ec);
+        return boost::asio::write(stream_, buffers, ec);
     }
 
     template <typename ConstBufferSequence>
-    std::size_t write(const ConstBufferSequence& buffers)
+    std::size_t write_some(const ConstBufferSequence& buffers)
     {
-        return stream_.write(buffers);
+        return boost::asio::write(stream_, buffers);
     }
 
     template <typename WriteHandler = cb_type>
         BOOST_ASIO_INITFN_RESULT_TYPE(WriteHandler,
             void (boost::system::error_code, std::size_t))
-    async_write(PacketBuffer && buffer,
+    async_write_some(PacketBuffer && buffer,
             BOOST_ASIO_MOVE_ARG(WriteHandler) handler = nullptr)
     {
         std::unique_ptr<packet> pack(new packet);
@@ -148,7 +154,7 @@ public:
     template <typename ConstBufferSequence, typename WriteHandler = cb_type>
         BOOST_ASIO_INITFN_RESULT_TYPE(WriteHandler,
             void (boost::system::error_code, std::size_t))
-    async_write(const ConstBufferSequence& buffers,
+    async_write_some(const ConstBufferSequence& buffers,
             BOOST_ASIO_MOVE_ARG(WriteHandler) handler = nullptr)
     {
         std::unique_ptr<packet> pack(new packet);
@@ -170,7 +176,7 @@ public:
         pack.release();
     }
 
-    /// ------------------- receive/read
+    /// ------------------- read_some
     template <typename MutableBufferSequence>
     std::size_t read_some(const MutableBufferSequence& buffers) {
         return stream_.read_some(buffers);
@@ -248,6 +254,8 @@ private:
             pack->destroy();
             pack = send_queue_.front();
         }
+
+        buffered_bytes_ = 0;
     }
 
     void handle_write(boost::system::error_code const& ec, size_t bytes)
@@ -284,7 +292,7 @@ private:
         flush();
     }
 
-    void post_handler(send_handler const& handler, boost::system::error_code const& ec, std::size_t n) {
+    void post_handler(write_handler const& handler, boost::system::error_code const& ec, std::size_t n) {
         if (handler) {
             get_io_context().post([handler, ec, n]()
                 {

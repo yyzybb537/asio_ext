@@ -1,8 +1,27 @@
 #pragma once
 #include <boost/asio.hpp>
 #include <boost/asio/streambuf.hpp>
+#include <boost/asio/buffer.hpp>
 #include <string>
 #include <cstddef>
+
+namespace boost {
+namespace asio {
+        
+template <typename Iter>
+inline Iter buffer_sequence_begin(std::pair<Iter, Iter> const& p)
+{
+  return p.first;
+}
+
+template <typename Iter>
+inline Iter buffer_sequence_end(std::pair<Iter, Iter> const& p)
+{
+  return p.second;
+}
+
+} //namespace asio
+} //namespace boost
 
 namespace asio_ext {
 
